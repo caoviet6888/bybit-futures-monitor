@@ -8,7 +8,7 @@ function candles(list,tf){return list.map(x=>{const t=Number(x[0]);if(x.length<7
 function instrument(x){return {symbol:x.symbol,baseAsset:x.baseCoin,quoteAsset:x.quoteCoin,marginAsset:x.settleCoin,status:'TRADING',contractType:'PERPETUAL',onboardDate:Number(x.launchTime),filters:[{filterType:'PRICE_FILTER',tickSize:x.priceFilter?.tickSize}]};}
 function eligible(x){return x.status==='Trading'&&x.contractType==='LinearPerpetual'&&x.quoteCoin==='USDT'&&x.settleCoin==='USDT';}
 function create(fetcher=fetch.bind(root)){async function get(path,params={},signal){const u=new URL('https://api.bybit.com/v5/market/'+path);for(const [k,v] of Object.entries(params))if(v!=null)u.searchParams.set(k,v);const r=await fetcher(u.href,{signal,cache:'no-store'});if(!r.ok)throw Error('Bybit HTTP '+r.status);const j=await r.json();if(j.retCode!==0)throw Error('Bybit '+j.retCode+': '+j.retMsg);return j;}
-return {async time(signal){const j=await get('time',{},signal);return {serverTime:Math.floor(Number(j.result.timeNano)/1e6)};},async universe(signal){let cursor='',seen=new Set(),out=new Map();do{if(seen.has(cursor))throw Error('Repeated cursor');seen.add(cursor);const j=await get('instruments-info',{category:'linear',limit:1000,cursor:cursor||undefined},signal);for(const x of j.result.list)if(eligible(x))out.set(x.symbol,instrument(x));cursor=j.result.nextPageCursor||'';}while(cursor);return {symbols:[...out.values()]};},async klines(symbol,tf,limit=500,signal){if(!intervals[tf])throw Error('Unsupported interval');const j=await get('kline',{category:'linear',symbol,interval:intervals[tf],limit:Math.min(1000,limit)},signal);return candles(j.result.list,tf);},async tickers(signal){const j=await get('tickers',{category:'linear'},signal);return j.result.list.map(x=>({symbol:x.symbol,lastPrice:x.lastPrice,price:x.lastPrice,priceChangePercent:String(Number(x.price24hPcnt)*100),quoteVolume:x.turnover24h,volume:x.volume24h}));}};}
+return {async time(signal){const j=await get('time',{},signal);return {serverTime:Math.floor(Number(j.result.timeNano)/1e6)};},async universe(signal){let cursor='',seen=new Set(),out=new Map();do{if(seen.has(cursor))throw Error('Repeated cursor');seen.add(cursor);const j=await get('instruments-info',{category:'linear',limit:1000,cursor:cursor||undefined},signal);for(const x of j.result.list)if(eligible(x))out.set(x.symbol,instrument(x));cursor=j.result.nextPageCursor||'';}while(cursor);return {symbols:[...out.values()]};},async klines(symbol,tf,limit=500,signal){if(!intervals[tf])throw Error('Unsupported interval');const j=await get('kline',{category:'linear',symbol,interval:intervals[tf],limit:Math.min(1000,limit)},signal);return candles(j.result.list,tf);},async tickers(signal){const j=await get('tickers',{category:'linear'},signal);return j.result.list.map(x=>({symbol:x.symbol,lastPrice:x.lastPrice,price:x.lastPrice,priceChangePercent:String(Number(x.price24hPcnt)*100),quoteVolume:x.turnover24h,volume:x.volume24h,highPrice:x.highPrice24h,lowPrice:x.lowPrice24h}));}};}
 root.BybitBeta8=Object.freeze({create,candles,eligible,intervals});
 })(globalThis);
 
@@ -36,7 +36,26 @@ const native=window.WebSocket, map=BybitBeta8.intervals, reverse=Object.fromEntr
 window.bybitBeta8Socket=function(url){
  const u=new URL(url), streams=(u.searchParams.get('streams')||'').split('/').filter(Boolean);
  const ticker=u.pathname.endsWith('/!ticker@arr');
- if(ticker||!streams.length){const e=new EventTarget();e.readyState=3;e.close=()=>{};queueMicrotask(()=>{e.onerror?.(new Event('error'));e.onclose?.(new Event('close'));});return e;}
+ if(ticker){
+ const e=new EventTarget(), sockets=[], cache=new Map();let closed=false,state=0,failed=false;
+ Object.defineProperty(e,'readyState',{get:()=>state});
+ function emit(type,event){e.dispatchEvent(event);e['on'+type]?.(event);}
+ function close(){if(closed)return;closed=true;state=3;for(const item of sockets){clearInterval(item.ping);item.w.close();}emit('close',new Event('close'));}
+ e.close=close;
+ function fail(){if(closed||failed)return;failed=true;emit('error',new Event('error'));close();}
+ (async()=>{try{
+ const universe=await BybitBeta8.create().universe();if(closed)return;
+ const symbols=universe.symbols.map(x=>x.symbol);if(!symbols.length)throw Error('Empty universe');
+ for(let i=0;i<symbols.length;i+=100){
+ const w=new native('wss://stream.bybit.com/v5/public/linear'),item={w,ping:null};sockets.push(item);
+ const topics=symbols.slice(i,i+100).map(x=>'tickers.'+x);
+ w.onopen=()=>{if(closed){w.close();return;}for(let j=0;j<topics.length;j+=10)w.send(JSON.stringify({op:'subscribe',args:topics.slice(j,j+10)}));item.ping=setInterval(()=>{if(w.readyState===1)w.send('{"op":"ping"}');},20000);if(state===0){state=1;emit('open',new Event('open'));}};
+ w.onmessage=ev=>{if(closed)return;try{const j=JSON.parse(ev.data);if(j.success===false){fail();return;}if(!j.topic?.startsWith('tickers.')||!j.data)return;const symbol=j.topic.slice(8),stamp=Number(j.ts),prev=cache.get(symbol);if(!Number.isFinite(stamp)||prev&&stamp<prev.stamp)return;if(j.type!=='snapshot'&&!prev)return;const x={...(j.type==='snapshot'?{}:prev?.data),...j.data};cache.set(symbol,{stamp,data:x});if([x.price24hPcnt,x.highPrice24h,x.lowPrice24h,x.lastPrice].some(v=>v==null||v===''||!Number.isFinite(Number(v))))return;emit('message',new MessageEvent('message',{data:JSON.stringify([{e:'24hrTicker',E:stamp,s:symbol,P:String(Number(x.price24hPcnt)*100),h:x.highPrice24h,l:x.lowPrice24h,c:x.lastPrice}])}));}catch(err){console.warn('Bybit ticker decode',err);}};
+ w.onerror=fail;w.onclose=()=>{clearInterval(item.ping);if(!closed)fail();};
+ }
+ }catch(err){fail();}})();return e;
+ }
+ if(!streams.length){const e=new EventTarget();e.readyState=3;e.close=()=>{};queueMicrotask(()=>{e.onerror?.(new Event('error'));e.onclose?.(new Event('close'));});return e;}
  const topics=streams.map(x=>{const [symbol,tf]=x.split('@kline_');if(!map[tf])throw Error('Unsupported Bybit stream '+x);return 'kline.'+map[tf]+'.'+symbol.toUpperCase();});
  const w=new native('wss://stream.bybit.com/v5/public/linear'), e=new EventTarget();Object.defineProperty(e,'readyState',{get:()=>w.readyState});e.close=()=>w.close();let ping;
  function emit(type,event){e.dispatchEvent(event);e['on'+type]?.(event);}
